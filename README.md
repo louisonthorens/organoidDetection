@@ -6,10 +6,7 @@ This work is licensed under the [Creative Commons Attribution 4.0 International 
 ## 📜 Citation
 If you use this code, please cite the following:
 
-- **Paper:**  
-  'TBD'
-
 - **GitHub Repository:**  
-  Louison Thorens. (2025). *Automated Organoids Detection* (v1.0).  
+  Louison Thorens. (2026). *Automated Organoids Detection* (v2.0).  
   Available at: [https://github.com/louisonthorens/organoidDetection](https://github.com/louisonthorens/organoidDetection)
 

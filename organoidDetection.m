@@ -1,271 +1,372 @@
 % ------------------------------------------------------------------------------
-% Automated Organoids Detection & Image Stitching
+% Automated Organoids Detection (Template Matching & Bottleneck Splitting)
 % Author: Louison Thorens - Institute of Mechanobiology - Northeastern University
 % Contact: l.thorens@northeastern.edu
-% Date: 2025-03-13
-% Version: 1.0
+% Date: 2026-02-23
+% Version: 2.0
 %
 % Description:
-% This script automates image stitching and detection of organoids.
+% This script automates the detection and segmentation of organoids in stitched 
+% grayscale images using 2D normalized cross-correlation (NCC) against a filter 
+% bank of disk templates. It incorporates adaptive thresholding and morphological 
+% bottleneck analysis to computationally bisect overlapping clusters.
 %
 % License:
 % This work is licensed under the Creative Commons Attribution 4.0 International License.
 % To view a copy of this license, visit https://creativecommons.org/licenses/by/4.0/
-%
-% If you use this code, please cite:
-% - Paper: TBD
-% - GitHub: Louison Thorens. (2025). Automated Cell Detection on Plates (v1.0)
-%           Available at: https://github.com/louisonthorens/organoidDetection
 % ------------------------------------------------------------------------------
 
-close all; clearvars; 
-
-% Initialize a table to store results
-results = table('Size', [0 4], ...
-               'VariableTypes', {'string', 'double', 'double', 'double'}, ...
-               'VariableNames', {'Label', 'Num_Cells', 'Average_Area_um2', 'Median_Area_um2'});
-
-folder = 'dataExample';
+close all; clearvars; clc;
 
 %%%
 % PARAMETERS
 %%%
-plateLetters = {'B'}; % for running through all plate positions
-plateNumbers = 1:2;
+folder             = '';
+plateLetters       = {'B'}; 
+plateNumbers       = 1;
 
-radiusCirclemm = 6.5; % radius of the container in mm
+% Template Filter Bank Parameters
+radii              = 9:1:40;       % Radii range for templates (px)
+rBoundary          = 4;            % Edge thickness for hollow templates (px)
 
-overlap_percentagex = 0.03; % 3% overlap in x
-overlap_percentagey = 0.02; % 2% overlap in y
+% Image Filtering & Thresholding Parameters
+blurSigma          = 5;            % Sigma for initial Gaussian blur
+bgSmoothSigma      = 100;          % Sigma for local background estimation
+localContrastThresh= 2.5;          % SNR threshold for initial binarization
+BWthreshold        = 500;          % Image background intensity threshold
 
-rows = 3; cols = 3; % arrangement of images for stitching
-
-contrast = [100 3000];
-
-binaryThreshold = 0.4;
-
-thresholdArea = 2000; % in px2
+% Morphological Analysis Parameters
+minAreaFilter      = 100;          % Minimum area to keep initial regions (px^2)
+maxEccentricity    = 0.99;         % 0=circle, ->1=line (filters out artifacts)
+eccentricityCut    = 0.7;          % Threshold to trigger bottleneck splitting
+finalAreaThreshold = 200;          % Final minimum area for valid organoids (px^2)
 
 %%%
 % MAIN LOOP
 %%%
-
 for iLetter = 1:length(plateLetters)
     letter = plateLetters{iLetter};
-    for iAB = plateNumbers
+    
+    for number = plateNumbers
+        close all;
+        fprintf('Processing %s - %d...\n', letter, number);
+        
         %%% 
         % LOADING AND PRE-PROCESSING OF IMAGE
         %%%
-        fprintf('Processing %s%d...\n', letter, iAB);
-        
-        xdceFile = dir([folder '/*.xdce']);
-        imageInfo = BioformatsImage([folder '/' xdceFile.name]);
-        scale = imageInfo.pxSize(1);
-       
-        files = ['*' letter ' - ' num2str(iAB) '(fld * wv Green - dsRed).tif'];
-
-        allFiles = dir(fullfile(folder, files));
-
-        if isempty(allFiles)
-            warning('No files found for %s. Skipping...', files);
+        imgFile = fullfile(folder, [letter ' - ' num2str(number) '_stitched_gray.tif']);
+        if ~isfile(imgFile)
+            warning('File %s not found. Skipping...', imgFile);
             continue;
         end
-
-        sample_img = imread(fullfile(folder, allFiles(1).name));
-        [height, width] = size(sample_img);
-        image_size = [height width];
-
-        % Compute overlap in pixels
-        overlap_x = round(width * overlap_percentagex);
-        overlap_y = round(height * overlap_percentagey);
-
-        % Calculate new dimensions after considering overlap
-        step_width = width - overlap_x;
-        step_height = height - overlap_y;
-
-        % Initialize the large image canvas and weight matrices
-        stitched_width = step_width * cols + overlap_x;
-        stitched_height = step_height * rows + overlap_y;
-        stitched_image = zeros(stitched_height, stitched_width);
-        weight_image = zeros(stitched_height, stitched_width); % For averaging
-
-        % Process and stitch the images
-        % Straight-forward stitching using known overlap
-        for r = 1:rows
-            for c = 1:cols
-                % Compute linear index
-                idx = (r - 1) * cols + c;
-
-                % Check if idx exceeds number of available files
-                if idx > length(allFiles)
-                    warning('Index %d exceeds number of available files. Skipping...', idx);
-                    continue;
-                end
-
-                % Read and crop the current image
-                img = imread(fullfile(folder, allFiles(idx).name));
-                cropped_img = img(1:step_height + overlap_y, 1:step_width + overlap_x); % Include overlap
-                % Compute position in the large image
-                start_x = (c - 1) * step_width + 1;
-                start_y = (r - 1) * step_height + 1;
-
-                end_x = start_x + size(cropped_img, 2) - 1;
-                end_y = start_y + size(cropped_img, 1) - 1;
-
-                % Ensure the stitched image is large enough
-                if end_x > stitched_width || end_y > stitched_height
-                    error('Stitched image size is too small. Increase stitched_width or stitched_height.');
-                end
-
-                % Accumulate pixel values for averaging
-                stitched_image(start_y:end_y, start_x:end_x) = stitched_image(start_y:end_y, start_x:end_x) + double(cropped_img);
-                weight_image(start_y:end_y, start_x:end_x) = weight_image(start_y:end_y, start_x:end_x) + 1;
-            end
+        img = double(imread(imgFile));
+        
+        %%% 
+        % GENERATE TEMPLATE FILTER BANK
+        %%%
+        nR = numel(radii);
+        templates = cell(1, nR * 2); % Allocate for solid and edge templates
+        
+        % 1. Solid disk templates
+        for ii = 1:nR
+            r = radii(ii);
+            t = fspecial('disk', r);          % filled disk
+            t = t ./ sum(t(:));               % unit energy
+            templates{ii} = t;
         end
-
-        % Compute the average in overlapping regions
-        stitched_image = double(stitched_image) ./ weight_image;                     
-
-        % Normalize the stitched image
-        stitched_image = (stitched_image - min(contrast)) / (max(contrast) - min(contrast));
-        stitched_image(stitched_image < 0) = 0; 
-        stitched_image(stitched_image > 1) = 1;
-
-        % Apply Non-Local Means Filtering - time consuming step
-        % stitched_image = imnlmfilt(stitched_image);
-        % disp('NLM done')
         
-        % Binarization of the image using user threshold
-        BG = stitched_image>0.01;
-        stats = regionprops(BG); areas = cat(1,stats.Area); [~,idMax] = max(areas);
-        center = stats(idMax).Centroid;
-        mask = zeros(size(stitched_image)); [X,Y] = meshgrid(1:size(mask,2),1:size(mask,1));
-        radiusCircle = 6.5*1e3/scale/2;
-        mask(sqrt((X-center(1)).^2 + (Y-center(2)).^2) <= radiusCircle) = 1;
-        imagesc(mask.*stitched_image)
-        
-        stitched_image = stitched_image.*mask;
-
-        % Display the image (optional)
-        figure();
-        imagesc(stitched_image);
-        clim([0 1]);
-        drawnow
-
-        % Create a red colormap
-        red_colormap = [linspace(0, 1, 256)', zeros(256, 1), zeros(256, 1)];
-        colormap(red_colormap);
-
-        colorbar_handle = colorbar;
-        ylabel(colorbar_handle, 'Normalized Fluorescence Intensity', 'FontSize', 12); % Add label to colorbar
-        axis equal; axis off;
-
-        title(files);
-        
-        % Save the stitched image
-        clean_filename = strrep(files, '*', ''); % Remove '*' if present
-        output_image_path = fullfile(folder, '/results', [clean_filename]);
-        imwrite(uint16((stitched_image)*2^16), output_image_path);
-        
-        % Binarization of the image using user threshold
-        bw = imbinarize(stitched_image, binaryThreshold);
-        bw = imclose(bw, strel('disk', 5));
-        bw = imfill(bw, 'holes');
-
-        stats = regionprops(bw, 'Centroid', 'Area','PixelList');
-
-        areas = [stats.Area];
-        stats = stats(areas >= thresholdArea);
-
-        if isempty(stats)
-            warning('No regions found for %s%d with area >= %d. Skipping...', letter, iAB, thresholdArea);
-            continue;
+        % 2. Edge-emphasized (dim center) templates
+        for ii = 1:nR
+            r = radii(ii);
+            t = double(fspecial('disk', r));  
+            t(t > 0) = 1;
+            [x, y] = meshgrid(1:size(t,1), 1:size(t,2));
+            % Dim the interior slightly
+            t(((x-mean(x(1,:))).^2 + (y-mean(y(:,1))).^2) < (r-rBoundary).^2) = 0.5;
+            t = t ./ sum(t(:));               
+            templates{ii+nR} = t;
         end
+        
+        %%% 
+        % CROSS-CORRELATION (TEMPLATE MATCHING)
+        %%%
+        I = img;
+        I = I - mean(I(:));
+        I = I ./ sqrt(sum(I(:).^2) + eps);     % zero‑mean, unit‑norm
+        Iblurred = imgaussfilt(I, blurSigma);
+        
+        Rmax   = -Inf(size(I));                % best score so far
+        Rscale = zeros(size(I));               % radius that produced Rmax
+        
+        % Initialize command-line progress tracker
+        fprintf('Cross-correlating %d templates\n', nR);
+        
+        % Loop through all templates and find best matches
+        for ii = 1:nR
 
-        centers = cat(1, stats.Centroid);
+            fprintf('%d / %d \n',ii,nR);
+            
+            t = templates{ii};
+            t = t - mean(t(:));                % zero‑mean, unit‑norm template
+            t = t ./ sqrt(sum(t(:).^2) + eps);
+            
+            r_temp = floor(size(t,1)/2);
+            R = normxcorr2(t, Iblurred);
+            R = R(r_temp:end-r_temp-1, r_temp:end-r_temp-1); % Crop to original size
+            
+            % Update the “winner‑takes‑all” maps
+            mask         = R > Rmax;
+            Rmax(mask)   = R(mask);
+            Rscale(mask) = radii(ii);        
+        end
+        fprintf('\n');
+        
+        %%% 
+        % ADAPTIVE THRESHOLDING & INITIAL MASKS
+        %%%
+        newImage = Rmax .* img; % Amplify original image with correlation score
+        newImage(newImage <= 1e-4) = 0;
 
-        % Initialize a cell array to store boundaries
-        num_regions = numel(stats); % Number of regions
-        boundaries = cell(num_regions, 1);
+        BG = img >= BWthreshold;
+        
+        % Local background correction
+        A = newImage ./ imgaussfilt(newImage, bgSmoothSigma);
+        A(A > 10) = 10; % Cap extreme outliers
 
-        % Loop through each region to extract boundaries
-        for k = 1:num_regions
-            % Create a blank binary image for the current region
-            region_image = false(stitched_height, stitched_width); % Updated to stitched image size
+        A(BG==0) = 0;
+        
+        % Binarization and morphological cleanup
+        BW = A > localContrastThresh;
+        BW = imfill(BW, 'holes');
+        I  = newImage;
+        
+        % Extract region properties
+        CC    = bwconncomp(BW);
+        stats = regionprops(CC, 'Centroid', 'MajorAxisLength', 'MinorAxisLength', ...
+            'Orientation', 'Area', 'Eccentricity', 'PixelIdxList');
+        
+        % Apply initial physical filters
+        keep = [stats.Area] >= minAreaFilter & ...
+               [stats.Eccentricity] <= maxEccentricity & ...
+               [stats.MinorAxisLength] > 0;
+        stats = stats(keep);
+        
+        %%% 
+        % MORPHOLOGICAL SPLITTING (BOTTLENECK ANALYSIS)
+        %%%
+        allBoundaries = {}; 
+        areas = [];
+        t_param = linspace(0, 2*pi, 200); % For parametric ellipses
 
-            % Get the PixelList for the current region
-            pixel_list = stats(k).PixelList; % Nx2 array [x, y]
+        % Initialize command-line progress tracker
+        fprintf('Analyzing %d objects\n', numel(stats));          
+        
+        for k = 1:numel(stats)
 
-            % Convert PixelList to linear indices and mark in binary image
-            linear_indices = sub2ind([stitched_height, stitched_width], round(pixel_list(:,2)), round(pixel_list(:,1)));
-            region_image(linear_indices) = true;
+            fprintf('%d / %d \n',k,numel(stats));
 
-            % Extract boundaries using bwboundaries
-            boundary = bwboundaries(region_image, 'noholes'); % Ignore holes for clean boundary
-
-            if ~isempty(boundary)
-                boundaries{k} = boundary{1};
+            cx = stats(k).Centroid(1);
+            cy = stats(k).Centroid(2);
+            a  = stats(k).MajorAxisLength/2;   
+            b  = stats(k).MinorAxisLength/2;   
+            th = -deg2rad(stats(k).Orientation);
+            e  = stats(k).Eccentricity;
+            
+            % Isolate the current component mask
+            maskHere = I*0; 
+            maskHere(stats(k).PixelIdxList) = 1;
+            maskHere = imclose(maskHere, strel('disk', 5));
+            
+            % If highly eccentric, attempt to cut
+            if e > eccentricityCut
+                x1 = cx + a*cos(0)*cos(th) - b*sin(0)*sin(th); 
+                y1 = cy + a*cos(0)*sin(th) + b*sin(0)*cos(th);
+                x2 = cx + a*cos(pi)*cos(th) - b*sin(pi)*sin(th); 
+                y2 = cy + a*cos(pi)*sin(th) + b*sin(pi)*cos(th);
+                
+                halfWidth = 50;
+                [H, W] = size(I);
+                xm = linspace(x1, x2, 1e3);                     
+                ym = linspace(y1, y2, 1e3);
+                dx = x2 - x1;                         
+                dy = y2 - y1;
+                len = hypot(dx, dy);
+                
+                if len < 1e-6
+                    dx = cos(th);                    
+                    dy = -sin(th);
+                    len = hypot(dx, dy);
+                end
+                
+                nx = -dy/len; 
+                ny = dx/len;            
+                Npts = max(3, 2*round(halfWidth)+1);
+                s    = linspace(-halfWidth, halfWidth, Npts);
+                xN   = xm' + s*nx;
+                yN   = ym' + s*ny;
+                
+                xN = min(max(xN, 1), W);
+                yN = min(max(yN, 1), H);
+                
+                % Sample profile along the normal
+                profile = interp2(medfilt2(I, [5 5]), xN, yN);
+                profile = mean(profile, 2);
+                profile = profile / max(profile);
+                
+                firstPos = find(profile >= 0.35, 1, 'first'); 
+                lastPos  = find(profile >= 0.35, 1, 'last');
+                profile(1:firstPos) = 1; 
+                profile(lastPos:end) = 1;
+                
+                toRemove = find(profile < 0.35); 
+                toRemove = toRemove(1:min(5, length(toRemove)));
+                toRemovej = round(xN(toRemove, :)); 
+                toRemovei = round(yN(toRemove, :));
+                
+                toRemoveIndex = sub2ind(size(maskHere), toRemovei, toRemovej);
+                newMask = maskHere;
+                newMask(toRemoveIndex) = 0;
+                newMask = bwareaopen(newMask, 50);
+                
+                statsHere = regionprops(bwmorph(newMask, 'thicken', 10), 'Centroid');
+                newMask = newMask*0;
+                centers = cat(1, statsHere.Centroid);
+                for ic = 1:size(centers, 1)
+                    newMask(round(centers(ic, 2)), round(centers(ic, 1))) = 1;
+                end
+                
+                newMask = bwmorph(newMask, 'thicken', 1e2);
+                boundaries = bwboundaries(newMask .* maskHere);
+                
+                % Check boundaries for neck points
+                for iBoundary = 1:length(boundaries)
+                    boundary = boundaries{iBoundary};
+                    xB = boundary(:, 2); 
+                    yB = boundary(:, 1);
+                    
+                    [doCut, i1, i2, width, score] = neck_decide_from_boundary(xB, yB);
+                    
+                    if ~doCut
+                        allBoundaries = cat(1, allBoundaries, boundary);
+                        areas(end+1) = polyarea(xB, yB);
+                    else
+                        % Bisect the boundary
+                        sorted = sort([i1, i2]);
+                        i1 = sorted(1); i2 = sorted(2);
+                        
+                        xB1 = xB(i1:i2); yB1 = yB(i1:i2);
+                        xB2 = xB; xB2(i1:i2) = []; 
+                        yB2 = yB; yB2(i1:i2) = [];
+                        
+                        allBoundaries = cat(1, allBoundaries, {[yB1, xB1]});
+                        areas(end+1) = polyarea(xB1, yB1);
+                        allBoundaries = cat(1, allBoundaries, {[yB2, xB2]});
+                        areas(end+1) = polyarea(xB2, yB2);
+                    end
+                end
             else
-                boundaries{k} = [];
+                % Normal cell, keep boundary as is
+                boundaries = bwboundaries(maskHere);
+                allBoundaries = cat(1, allBoundaries, boundaries);
+                for iBoundary = 1:length(boundaries)
+                    boundary = boundaries{iBoundary};
+                    xB = boundary(:, 2); 
+                    yB = boundary(:, 1);
+                    areas(end+1) = polyarea(xB, yB);
+                end
             end
         end
-
-        % Display the stitched image with boundaries
-        figure()
-        imagesc(stitched_image);
-        stitched_imageColor = zeros(size(stitched_image,1),size(stitched_image,2),3);
-        stitched_imageColor(:,:,1) = stitched_image;
-        overlayBoundaries = zeros(size(stitched_imageColor));
-        clim([0 1]);
-        colormap(red_colormap);
-        axis equal; axis off;
-        hold on;
-        for k = 1:num_regions
-            boundary = boundaries{k};
-            for k = 1:length(boundary)
-                overlayBoundaries(boundary(k,1), boundary(k,2),:) = 1;
-            end
-            if ~isempty(boundary)
-                plot(boundary(:,2), boundary(:,1), 'w', 'LineWidth', 1.5); % (x, y) -> column, row
-            end
-        end
-
-        finalImageColor = stitched_imageColor + imdilate(overlayBoundaries,strel('disk',5));
+        fprintf('\n');
         
-        % Compute metrics
-        num_cells = length(stats);
-        average_area = mean([stats.Area]);
-        median_area = median([stats.Area]);
-
-        % Save the annotated image
-        annotated_filename = strrep(clean_filename, '.tif', '.jpg'); % Change extension to .jpg
-        annotated_image_path = fullfile(folder, '/results', annotated_filename);
-        imwrite(finalImageColor,annotated_image_path)
-
-        % Close the stitched image figure
-        close(gcf);
-
-        % Create label 
-        label = sprintf('%s%d', letter, iAB);
-
-        % Compute scaled areas
-        average_area_um2 = average_area * scale^2;
-        median_area_um2 = median_area * scale^2;
-
-        % Append the data to the results table
-        newRow = {label, num_cells, average_area_um2, median_area_um2};
-        results = [results; newRow];
+        %%%
+        % SAVING OUTPUTS
+        %%%
+        close all;
+        figure('units', 'normalized', 'outerposition', [0 0 1 1]);
+        imagesc(img);
+        hold on; axis equal; colormap gray; axis off;
+        clim([0 5e3]);
+        
+        % Filter out final small noise objects
+        goodOnes = find(areas >= finalAreaThreshold);
+        for k = goodOnes
+            plot(allBoundaries{k}(:, 2), allBoundaries{k}(:, 1), 'LineWidth', 2);
+        end
+        title(sprintf('Detected %d organoids', length(goodOnes)));
+        
+        % Save MAT and TIF
+        matName = fullfile(folder, [letter ' - ' num2str(number) '_stitched_gray.mat']);
+        tifName = fullfile(folder, [letter ' - ' num2str(number) '_stitched_gray_detection.tif']);
+        
+        save(matName, 'allBoundaries', 'areas');
+        saveas(gcf, tifName);
+        
+        fprintf('Saved results for %s - %d\n', letter, number);
     end
 end
 
 %%%
-% SAVING
+% HELPER FUNCTIONS
 %%%
-
-% Define the output CSV file path
-output_csv = fullfile(folder, '/results', 'summary_results.csv');
-
-% Write the table to CSV
-writetable(results, output_csv);
-
-fprintf('Results have been saved to %s\n', output_csv);
+function [doCut, i1, i2, width, score] = neck_decide_from_boundary(x, y, params)
+    % Decide if a component should be split at a "neck" using only its boundary.
+    if nargin < 3
+        params.arcFracMin  = 0.15;
+        params.maxWidthPx  = 75;
+        params.scoreThr    = 0.3;
+        params.sgolWinFrac = 0.02;
+    end
+    
+    % Ensure open polygon
+    if x(1)==x(end) && y(1)==y(end)
+        x(end)=[]; y(end)=[];
+    end
+    x = double(x(:)); y = double(y(:));
+    N = numel(x);
+    
+    if N < 10
+        doCut=false; i1=[]; i2=[]; width=Inf; score=Inf; return; 
+    end
+    
+    % Smooth boundary
+    win = max(5, 2*floor(params.sgolWinFrac*N)+1); 
+    if mod(win, 2) == 0, win = win + 1; end
+    
+    try
+        x = sgolayfilt(x, 3, win); 
+        y = sgolayfilt(y, 3, win);
+    catch
+        x = movmean([x(end-win+1:end); x; x(1:win)], win); x = x(win+1:win+N);
+        y = movmean([y(end-win+1:end); y; y(1:win)], win); y = y(win+1:win+N);
+    end
+    
+    % Perimeter via arc lengths
+    perim = sum(hypot(diff([x; x(1)]), diff([y; y(1)])));
+    
+    idx  = (1:N)';
+    dIdx = abs(idx - idx');                        
+    dIdx = min(dIdx, N - dIdx);                    
+    arcDist = dIdx * (perim / N);
+    
+    % Pairwise Euclidean distance
+    Dx = x - x'; Dy = y - y';
+    D  = hypot(Dx, Dy);
+    
+    % Candidate mask
+    amin  = params.arcFracMin * perim;
+    cand  = arcDist >= amin;
+    D(~cand) = Inf;         
+    D(D < 2) = Inf;         
+    
+    % Score and Decision
+    Score = D ./ (arcDist + eps);
+    [score, idxLin] = min(Score(:));
+    
+    if ~isfinite(score)
+        doCut=false; i1=[]; i2=[]; width=Inf; return;
+    end
+    
+    [i1, i2] = ind2sub([N N], idxLin);
+    width   = D(i1, i2);
+    doCut   = (width <= params.maxWidthPx) && (score <= params.scoreThr);
+end
